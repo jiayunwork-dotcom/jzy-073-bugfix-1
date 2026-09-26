@@ -7,6 +7,9 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+# One command both builds the image and runs the full automated test suite
+# inside the toolchain container; the image build fails if any test fails.
+RUN CGO_ENABLED=0 go test ./...
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/isa-service ./cmd/server
 
 # Minimal runtime image (no shell needed); the scratch base is only for

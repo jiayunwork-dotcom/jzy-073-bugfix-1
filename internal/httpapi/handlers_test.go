@@ -131,3 +131,161 @@ func TestHealthz(t *testing.T) {
 		t.Errorf("healthz status = %d, want 200", code)
 	}
 }
+
+// 单点：极冷偏差使密度高度反解落到海平面以下，必须 400 + 结构化越界错误，
+// 绝不能在响应体里塞一个负密度高度的“成功”结果。
+func TestPointEndpointDensityAltitudeBelowFloor(t *testing.T) {
+	code, body := getJSON(t, "/api/isa/point?altitude=0&delta_t=-100")
+	if code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body = %v)", code, body)
+	}
+	if body["error"] != "out_of_model_range" {
+		t.Errorf("error = %v, want out_of_model_range", body["error"])
+	}
+	if reason, _ := body["reason"].(string); reason == "" {
+		t.Errorf("structured reason missing: %v", body)
+	}
+	if body["direction"] != "below_sea_level" {
+		t.Errorf("direction = %v, want below_sea_level", body["direction"])
+	}
+	if _, present := body["density_altitude_m"]; present {
+		t.Errorf("out-of-range response must not carry a fabricated density altitude: %v", body)
+	}
+}
+
+// 单点：极热偏差使密度高度反解落到 20 km 以上，同样 400 + 结构化越界错误。
+func TestPointEndpointDensityAltitudeAboveCeiling(t *testing.T) {
+	code, body := getJSON(t, "/api/isa/point?altitude=20000&delta_t=50")
+	if code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body = %v)", code, body)
+	}
+	if body["error"] != "out_of_model_range" {
+		t.Errorf("error = %v, want out_of_model_range", body["error"])
+	}
+	if reason, _ := body["reason"].(string); reason == "" {
+		t.Errorf("structured reason missing: %v", body)
+	}
+	if body["direction"] != "above_ceiling" {
+		t.Errorf("direction = %v, want above_ceiling", body["direction"])
+	}
+}
+
+// 边界检查不能误伤合法请求：很深的偏差只要密度高度仍落在模型范围内，
+// 照常 200 且返回一个远离几何高度但合法的密度高度。
+func TestPointEndpointExtremeButInRangeOffsetStillSucceeds(t *testing.T) {
+	// h = 10000 m with -100 K: equivalent altitude ~6.2 km, in range.
+	code, body := getJSON(t, "/api/isa/point?altitude=10000&delta_t=-100")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body = %v)", code, body)
+	}
+	da := body["density_altitude_m"].(float64)
+	if da < 0 || da > 20000 {
+		t.Errorf("in-range density altitude = %v, want within [0,20000]", da)
+	}
+	// h = 0 m with +250 K: equivalent altitude still far below the ceiling.
+	code, body = getJSON(t, "/api/isa/point?altitude=0&delta_t=250")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body = %v)", code, body)
+	}
+	da = body["density_altitude_m"].(float64)
+	if da < 0 || da > 20000 {
+		t.Errorf("in-range density altitude = %v, want within [0,20000]", da)
+	}
+}
+
+// 批量，偏冷方向：只有越界采样点失败（结构化原因），其余点保持正常，
+// 整批仍 200 且 failed_count 只数失败点。
+func TestProfileEndpointPerPointFailureColdSide(t *testing.T) {
+	code, body := getJSON(t, "/api/isa/profile?start=0&end=20000&step=10000&delta_t=-100")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 with per-point failure (body = %v)", code, body)
+	}
+	if body["failed_count"].(float64) != 1 {
+		t.Errorf("failed_count = %v, want 1", body["failed_count"])
+	}
+	points := body["points"].([]any)
+	if len(points) != 3 {
+		t.Fatalf("points length = %d, want 3 (bad sample must keep its slot)", len(points))
+	}
+
+	bad := points[0].(map[string]any)
+	if bad["status"] != "out_of_model_range" || bad["error"] != "out_of_model_range" {
+		t.Errorf("bad point shape wrong: %v", bad)
+	}
+	if bad["direction"] != "below_sea_level" {
+		t.Errorf("bad point direction = %v, want below_sea_level", bad["direction"])
+	}
+	if reason, _ := bad["reason"].(string); reason == "" {
+		t.Errorf("bad point structured reason missing: %v", bad)
+	}
+	if bad["altitude_m"].(float64) != 0 || bad["index"].(float64) != 0 {
+		t.Errorf("bad point identity wrong: %v", bad)
+	}
+	if _, present := bad["density_altitude_m"]; present {
+		t.Errorf("bad point must not carry a fabricated density altitude: %v", bad)
+	}
+
+	// The two legal points keep the exact success shape.
+	for i := 1; i <= 2; i++ {
+		p := points[i].(map[string]any)
+		if _, present := p["status"]; present {
+			t.Errorf("good point %d must keep the plain success shape: %v", i, p)
+		}
+		if _, present := p["density_altitude_m"]; !present {
+			t.Errorf("good point %d missing density_altitude_m: %v", i, p)
+		}
+		h := p["altitude_m"].(float64)
+		direct, err := isa.Model(h, -100)
+		if err != nil {
+			t.Fatalf("direct Model(%v,-100) error: %v", h, err)
+		}
+		if math.Abs(p["pressure_pa"].(float64)-direct.Pressure) > 1e-6 {
+			t.Errorf("good point %d pressure disagrees with direct Model", i)
+		}
+	}
+}
+
+// 批量，偏热方向：只有 20 km 采样点失败，其余正常，且槽位/索引不丢。
+func TestProfileEndpointPerPointFailureHotSide(t *testing.T) {
+	code, body := getJSON(t, "/api/isa/profile?start=0&end=20000&step=10000&delta_t=50")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 with per-point failure (body = %v)", code, body)
+	}
+	if body["failed_count"].(float64) != 1 {
+		t.Errorf("failed_count = %v, want 1", body["failed_count"])
+	}
+	points := body["points"].([]any)
+	bad := points[2].(map[string]any)
+	if bad["status"] != "out_of_model_range" || bad["direction"] != "above_ceiling" {
+		t.Errorf("bad point shape/direction wrong: %v", bad)
+	}
+	if bad["altitude_m"].(float64) != 20000 || bad["index"].(float64) != 2 {
+		t.Errorf("bad point identity wrong: %v", bad)
+	}
+	// Neighbouring legal points are untouched.
+	for i := 0; i <= 1; i++ {
+		p := points[i].(map[string]any)
+		if _, present := p["error"]; present {
+			t.Errorf("point %d unexpectedly marked failed: %v", i, p)
+		}
+	}
+}
+
+// 批量全部合法（即使偏差很深、密度高度离几何高度很远）：failed_count 必须为 0。
+func TestProfileEndpointAllInRangeHasNoFailures(t *testing.T) {
+	// 5..15 km with -100 K: every equivalent altitude stays well inside
+	// [0, 20000 m] even though it sits far below the geometric altitude.
+	code, body := getJSON(t, "/api/isa/profile?start=5000&end=15000&step=5000&delta_t=-100")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body = %v)", code, body)
+	}
+	if body["failed_count"].(float64) != 0 {
+		t.Errorf("failed_count = %v, want 0", body["failed_count"])
+	}
+	for i, pt := range body["points"].([]any) {
+		p := pt.(map[string]any)
+		if _, present := p["error"]; present {
+			t.Errorf("point %d unexpectedly failed: %v", i, p)
+		}
+	}
+}

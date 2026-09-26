@@ -12,12 +12,29 @@ import (
 
 // errorBody is the single structured error shape returned by every failure.
 type errorBody struct {
-	Error  string `json:"error"`
-	Reason string `json:"reason"`
+	Error     string `json:"error"`
+	Reason    string `json:"reason"`
+	Direction string `json:"direction,omitempty"`
 }
 
 func badRequest(c *gin.Context, reason string) {
 	c.JSON(http.StatusBadRequest, errorBody{Error: "invalid_request", Reason: reason})
+}
+
+// modelError maps a model-layer error onto the structured error shape. A
+// density-altitude inversion that left the implemented layer range gets its
+// own machine-readable code (and direction); everything else is a plain
+// invalid request.
+func modelError(c *gin.Context, err error) {
+	if r, ok := isa.AsOutOfModelRangeError(err); ok {
+		c.JSON(http.StatusBadRequest, errorBody{
+			Error:     "out_of_model_range",
+			Reason:    r.Error(),
+			Direction: r.Direction,
+		})
+		return
+	}
+	badRequest(c, err.Error())
 }
 
 // parseFloat reads a float64 query parameter. required=false returns def when
@@ -49,7 +66,7 @@ func handlePoint(c *gin.Context) {
 
 	a, err := isa.Model(h, deltaT)
 	if err != nil {
-		badRequest(c, err.Error())
+		modelError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, a)
@@ -76,12 +93,19 @@ func handleProfile(c *gin.Context) {
 		badRequest(c, err.Error())
 		return
 	}
+	failed := 0
+	for _, p := range points {
+		if p.Failed() {
+			failed++
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"start_m":              start,
 		"end_m":                end,
 		"step_m":               step,
 		"temperature_offset_k": deltaT,
 		"count":                len(points),
+		"failed_count":         failed,
 		"points":               points,
 	})
 }

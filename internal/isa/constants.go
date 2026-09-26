@@ -66,6 +66,12 @@ var (
 	// inverses.
 	seaLevelDensityComputed = idealGasDensity(SeaLevelPressure, SeaLevelTemperature)
 
+	// Standard density at the 20 km implementation ceiling (ModelCeiling),
+	// produced by the isothermal-layer formula. It is the lower density bound
+	// the density-altitude inversion can map to without leaving the
+	// implemented model range.
+	ceilingDensity = isothermalDensity(ModelCeiling)
+
 	// g/(R*T1): pressure/density decay coefficient in the isothermal layer.
 	isothermalDecayCoefficient = Gravity / (GasConstant * tropopauseTemperature)
 )
