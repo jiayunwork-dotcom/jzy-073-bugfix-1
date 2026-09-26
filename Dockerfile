@@ -7,6 +7,9 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+# The full automated test suite runs inside the image build: a failing test
+# fails `docker build`, so the shipped image always corresponds to green tests.
+RUN go test ./...
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/isa-service ./cmd/server
 
 # Minimal runtime image (no shell needed); the scratch base is only for

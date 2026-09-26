@@ -71,6 +71,10 @@ func standardState(h float64) (temperature, pressure float64) {
 // only replaces the temperature that feeds the ideal-gas density and the
 // speed of sound — the standard pressure profile and the actual temperature
 // are deliberately kept independent.
+//
+// An offset that pushes the density outside the modelled layers (density
+// altitude below 0 m or above the 20 km ceiling) is rejected with a
+// ValidationError: the model does not extrapolate.
 func Model(h, deltaT float64) (Atmosphere, error) {
 	if err := validateAltitude(h); err != nil {
 		return Atmosphere{}, err
@@ -106,12 +110,48 @@ func Model(h, deltaT float64) (Atmosphere, error) {
 // MaxProfilePoints bounds the size of a single profile response.
 const MaxProfilePoints = 100000
 
+// PointResult is the outcome of one sampled profile point: either the full
+// atmosphere state or the reason the sample was rejected (for example
+// because a temperature offset pushed its density altitude outside the
+// modelled layers). Exactly one of Atmosphere/Err is set; Altitude is always
+// the sampled geometric altitude.
+type PointResult struct {
+	Altitude   float64
+	Atmosphere Atmosphere
+	Err        error
+}
+
 // Profile evaluates the atmosphere at the evenly spaced altitudes
 // start, start+step, ... not exceeding end. Points are generated with integer
 // indexing to avoid floating-point accumulation drift. If end is not an exact
 // multiple of step above start, the last returned point is the largest
 // multiple below end (the endpoint is not stretched).
+//
+// Profile is strict: the first sample the model refuses aborts the whole
+// profile. Use ProfilePoints when individual sample failures should be
+// reported alongside the valid points instead.
 func Profile(start, end, step, deltaT float64) ([]Atmosphere, error) {
+	results, err := ProfilePoints(start, end, step, deltaT)
+	if err != nil {
+		return nil, err
+	}
+	points := make([]Atmosphere, 0, len(results))
+	for _, r := range results {
+		if r.Err != nil {
+			return nil, r.Err
+		}
+		points = append(points, r.Atmosphere)
+	}
+	return points, nil
+}
+
+// ProfilePoints samples the atmosphere exactly like Profile but evaluates
+// every point independently: a sample the model refuses is reported in that
+// sample's Err (with its Altitude) while the remaining samples are still
+// returned — one out-of-range point neither leaks a wild value into the
+// results nor condemns the rest of the batch. Structural problems (invalid
+// interval, step, offset, or too many points) still fail the whole call.
+func ProfilePoints(start, end, step, deltaT float64) ([]PointResult, error) {
 	if err := validateAltitude(start); err != nil {
 		return nil, InvalidArgumentError("start: " + err.Error())
 	}
@@ -132,7 +172,7 @@ func Profile(start, end, step, deltaT float64) ([]Atmosphere, error) {
 		return nil, InvalidArgumentError("profile would contain more than 100000 points; widen the step or shrink the interval")
 	}
 
-	points := make([]Atmosphere, 0, count)
+	results := make([]PointResult, 0, count)
 	for i := 0; i < count; i++ {
 		h := start + float64(i)*step
 		if h > end { // guard against rounding at the upper end
@@ -140,9 +180,10 @@ func Profile(start, end, step, deltaT float64) ([]Atmosphere, error) {
 		}
 		a, err := Model(h, deltaT)
 		if err != nil {
-			return nil, err
+			results = append(results, PointResult{Altitude: h, Err: err})
+			continue
 		}
-		points = append(points, a)
+		results = append(results, PointResult{Altitude: h, Atmosphere: a})
 	}
-	return points, nil
+	return results, nil
 }
